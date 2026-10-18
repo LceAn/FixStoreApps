@@ -1,0 +1,10 @@
+# 运行日志与备份
+logs/
+*.log
+
+# 数据目录改名备份
+*.bak-*
+
+# 系统杂项
+Thumbs.db
+Desktop.ini
