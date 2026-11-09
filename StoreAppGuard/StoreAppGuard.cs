@@ -308,6 +308,12 @@ namespace StoreAppGuard
     // ==================== 主窗口 ====================
     internal sealed class MainForm : Form
     {
+        // Shell 高清图标提取: 从 EXE 的 ICO 资源里按需取大尺寸 (可拿满 256 源缩到 64)
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHDefExtractIcon(string path, int index, uint flags, out IntPtr hLarge, out IntPtr hSmall, uint size);
+        [DllImport("user32.dll")]
+        private static extern bool DestroyIcon(IntPtr h);
+
         private readonly Engine engine;
         private readonly GuardContext owner;
         private readonly Icon icoGreen, icoOrange;
@@ -491,7 +497,7 @@ namespace StoreAppGuard
             grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
             grid.ColumnHeadersHeight = 30;
-            grid.RowTemplate.Height = 34;
+            grid.RowTemplate.Height = 40;
             grid.Columns.Add("app", "应用");
             grid.Columns["app"].FillWeight = 26;
             grid.Columns.Add("state", "状态");
@@ -507,11 +513,40 @@ namespace StoreAppGuard
             DataGridViewImageColumn imgCol = new DataGridViewImageColumn(false);
             imgCol.HeaderText = "";
             imgCol.Name = "icon";
-            imgCol.Width = 42;
+            imgCol.Width = 48;
             imgCol.ImageLayout = DataGridViewImageCellLayout.Zoom;
             imgCol.SortMode = DataGridViewColumnSortMode.NotSortable;
             imgCol.DefaultCellStyle.NullValue = null; // 值为 null 时留白, 不画红色错误占位图
             grid.Columns.Insert(0, imgCol);
+
+            // ---- 右键菜单: 对"待人工处理"等状态的行直接可操作 ----
+            rowMenu = new ContextMenuStrip();
+            miOpen = new ToolStripMenuItem("打开应用", null, MenuLaunchApp);
+            miRetry = new ToolStripMenuItem("立即重试修复", null, MenuRetryFix);
+            miStore = new ToolStripMenuItem("在微软商店中搜索 (重装)", null, MenuStoreSearch);
+            rowMenu.Items.AddRange(new ToolStripItem[] { miOpen, miRetry, miStore, new ToolStripSeparator() });
+            rowMenu.Items.Add("复制包族名", null, MenuCopyFamily);
+            rowMenu.Opening += delegate(object s, System.ComponentModel.CancelEventArgs e)
+            {
+                if (string.IsNullOrEmpty(rightClickedFam)) { e.Cancel = true; return; }
+                bool ignored = false;
+                foreach (Engine.PkgView v in engine.GetStateSnapshot())
+                {
+                    if (v.Family == rightClickedFam) { ignored = (v.ManualUntil == DateTime.MaxValue); break; }
+                }
+                miOpen.Enabled = !ignored;
+                miRetry.Enabled = !ignored;
+            };
+            grid.ContextMenuStrip = rowMenu;
+            grid.CellMouseDown += delegate(object s, DataGridViewCellMouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Right && e.RowIndex >= 0)
+                {
+                    grid.ClearSelection();
+                    grid.Rows[e.RowIndex].Selected = true;
+                    rightClickedFam = grid.Rows[e.RowIndex].Tag as string;
+                }
+            };
 
             Panel gp = new Panel();
             gp.Dock = DockStyle.Fill;
@@ -529,6 +564,53 @@ namespace StoreAppGuard
         }
 
         private SplitContainer split;
+        private ContextMenuStrip rowMenu;
+        private ToolStripMenuItem miOpen, miRetry, miStore;
+        private volatile string rightClickedFam;
+
+        // ---- 右键菜单动作 ----
+
+        private void MenuLaunchApp(object s, EventArgs e)
+        {
+            string fam = rightClickedFam;
+            if (string.IsNullOrEmpty(fam)) return;
+            engine.WriteLog("右键操作: 启动应用 " + fam);
+            Task.Factory.StartNew(delegate
+            {
+                // Get-StartApps 拿准确 AUMID (兼容 bundle 包), 再 shell:AppsFolder 启动
+                string script =
+                    "$s = Get-StartApps | Where-Object { $_.AppID -like '" + fam.Replace("'", "''") + "!*' } | Select-Object -First 1; "
+                    + "if (-not $s) { 'NOAPP' } else { Start-Process ('shell:AppsFolder\' + $s.AppID); 'LAUNCH-OK' }";
+                string r = engine.RunPs(script, 60);
+                engine.WriteLog("启动 " + fam + " -> " + (r == null ? "超时" : r.Trim()));
+            });
+        }
+
+        private void MenuRetryFix(object s, EventArgs e)
+        {
+            string fam = rightClickedFam;
+            if (string.IsNullOrEmpty(fam)) return;
+            engine.WriteLog("右键操作: 重试修复 " + fam);
+            Task.Factory.StartNew(delegate { try { engine.ManualRetry(fam); } catch { } });
+        }
+
+        private void MenuStoreSearch(object s, EventArgs e)
+        {
+            string fam = rightClickedFam;
+            if (string.IsNullOrEmpty(fam)) return;
+            try
+            {
+                string q = PrettyName(fam);
+                Process.Start(new ProcessStartInfo("ms-windows-store://search/?query=" + Uri.EscapeDataString(q)) { UseShellExecute = true });
+            }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "打开商店失败"); }
+        }
+
+        private void MenuCopyFamily(object s, EventArgs e)
+        {
+            if (string.IsNullOrEmpty(rightClickedFam)) return;
+            try { Clipboard.SetText(rightClickedFam); } catch { }
+        }
 
         // ---- 实时日志面板 ----
         private void BuildLogPanel()
@@ -655,7 +737,7 @@ namespace StoreAppGuard
             });
         }
 
-        // 从包清单找主程序 EXE -> 取它的图标
+        // 从包清单找主程序 EXE -> Shell 接口提取高清图标 -> 高质量缩放到 32px
         private static Image ExtractAppIcon(string loc)
         {
             try
@@ -683,18 +765,47 @@ namespace StoreAppGuard
                 if (exe == null) return null;
                 string full = Path.Combine(loc, exe);
                 if (!File.Exists(full)) return null;
+
+                // 先试 Shell 大图标 (64px), 失败再退回经典 32px 提取
+                IntPtr hLarge, hSmall;
+                if (SHDefExtractIcon(full, 0, 0, out hLarge, out hSmall, 64) == 0 && hLarge != IntPtr.Zero)
+                {
+                    try
+                    {
+                        using (Icon ic = Icon.FromHandle(hLarge))
+                        using (Bitmap src = ic.ToBitmap())
+                        {
+                            return ScaleHq(src, 32);
+                        }
+                    }
+                    finally
+                    {
+                        DestroyIcon(hLarge);
+                        if (hSmall != IntPtr.Zero) DestroyIcon(hSmall);
+                    }
+                }
                 using (Icon ic = Icon.ExtractAssociatedIcon(full))
                 {
                     if (ic == null) return null;
-                    using (Bitmap b = ic.ToBitmap())
-                    {
-                        Bitmap small = new Bitmap(b, 24, 24);
-                        small.SetResolution(b.HorizontalResolution, b.VerticalResolution);
-                        return small;
-                    }
+                    using (Bitmap b = ic.ToBitmap()) return ScaleHq(b, 32);
                 }
             }
             catch { return null; }
+        }
+
+        // 高质量缩放 (双三次插值, 不走 DrawImage 的低质量默认)
+        private static Bitmap ScaleHq(Bitmap src, int size)
+        {
+            Bitmap dst = new Bitmap(size, size);
+            using (Graphics g = Graphics.FromImage(dst))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+                g.CompositingQuality = CompositingQuality.HighQuality;
+                g.DrawImage(src, new Rectangle(0, 0, size, size), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel);
+            }
+            return dst;
         }
 
         // 显示名: 系统仓库注册表 -> ms-resource 时回退到包名美化
@@ -772,7 +883,9 @@ namespace StoreAppGuard
 
                     string lastfix = v.LastRepair == DateTime.MinValue ? "-" : v.LastRepair.ToString("MM-dd HH:mm");
                     int i = grid.Rows.Add(ico, name, status, v.Rung == 0 ? "-" : "第" + v.Rung + "级", lastfix, run);
-                    grid.Rows[i].Cells[1].ToolTipText = v.Family; // 悬停看包族名
+                    grid.Rows[i].Tag = v.Family;                       // 右键菜单据此定位
+                    grid.Rows[i].Cells[1].ToolTipText = v.Family;      // 悬停看包族名
+                    grid.Rows[i].Cells[2].ToolTipText = "右键此行可: 打开应用 / 立即重试修复 / 商店搜索重装";
                     grid.Rows[i].Cells[1].Style.ForeColor = Color.FromArgb(30, 30, 30);
                     grid.Rows[i].Cells[2].Style.ForeColor = c;
                     grid.Rows[i].Cells[5].Style.ForeColor = run == "●" ? Color.Green : Color.DimGray;
@@ -1406,6 +1519,22 @@ namespace StoreAppGuard
             SaveState();
         }
 
+        // 用户在界面上主动要求重试: 清冷静期/冷却, 从第1级重新开始
+        internal void ManualRetry(string fam)
+        {
+            lock (gate)
+            {
+                PkgState st;
+                if (!states.TryGetValue(fam, out st)) return;
+                st.ManualUntil = DateTime.MinValue;
+                st.Rung = 0;
+                st.LastRepair = DateTime.MinValue;
+                st.NotifiedManual = false;
+            }
+            WriteLog("手动重试修复: " + fam + " (用户触发)");
+            RepairFamily(fam);
+        }
+
         private PkgState GetState(string fam)
         {
             lock (gate)
@@ -1596,6 +1725,9 @@ namespace StoreAppGuard
         }
 
         // ---------------- 其他 ----------------
+
+        // 供 UI 右键菜单执行任意 PS (已限定内部使用)
+        internal string RunPs(string script, int timeoutSec) { return PsText(script, timeoutSec); }
 
         private void SetBusy(bool b)
         {
