@@ -34,11 +34,12 @@ namespace StoreAppGuard
         [STAThread]
         internal static void Main(string[] args)
         {
-            // ---- 命令行模式: StoreAppGuard.exe --once [--days N] ----
-            bool once = false; int days = 3;
+            // ---- 命令行模式 ----
+            bool once = false, viewerOnly = false; int days = 3;
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--once" || args[i] == "/once") once = true;
+                if (args[i] == "--logviewer" || args[i] == "/logviewer") viewerOnly = true;
                 if ((args[i] == "--days" || args[i] == "/days") && i + 1 < args.Length)
                 {
                     int d; if (int.TryParse(args[i + 1], out d) && d > 0 && d <= 365) days = d;
@@ -49,6 +50,13 @@ namespace StoreAppGuard
                 try { AttachConsole(ATTACH_PARENT_PROCESS); } catch { }
                 Engine e = new Engine(null);
                 e.RunSweepOnce(days);
+                return;
+            }
+            if (viewerOnly) // 只打开日志查看器窗口 (调试/菜单用)
+            {
+                Application.EnableVisualStyles();
+                Application.SetCompatibleTextRenderingDefault(false);
+                Application.Run(new LogViewerForm(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs")));
                 return;
             }
 
@@ -71,6 +79,7 @@ namespace StoreAppGuard
         private readonly Engine engine;
         private readonly Icon icoGreen, icoOrange;
         private readonly ToolStripMenuItem miAutoStart;
+        private LogViewerForm viewer;   // 日志窗口单例
 
         internal GuardContext()
         {
@@ -83,6 +92,7 @@ namespace StoreAppGuard
 
             var menu = new ContextMenuStrip();
             menu.Items.Add(new ToolStripMenuItem("立即检查修复", null, delegate { RunBg(delegate { engine.RunSweepOnce(3); }, "手动扫描"); }));
+            menu.Items.Add(new ToolStripMenuItem("查看日志", null, delegate { ShowViewer(); }));
             menu.Items.Add(new ToolStripMenuItem("打开日志目录", null, delegate { TryOpenDir(engine.LogDir); }));
             miAutoStart = new ToolStripMenuItem("开机自动启动", null, MenuAutoStartToggle);
             miAutoStart.Checked = AutoStartEnabled;
@@ -144,6 +154,18 @@ namespace StoreAppGuard
             catch { }
         }
 
+        // 打开内置日志查看器 (已打开则置前)
+        private void ShowViewer()
+        {
+            try
+            {
+                if (viewer != null && !viewer.IsDisposed) { viewer.Show(); viewer.Activate(); return; }
+                viewer = new LogViewerForm(engine.LogDir);
+                viewer.Show();
+            }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "打开日志失败"); }
+        }
+
         private void RunBg(Action a, string what)
         {
             Task.Factory.StartNew(delegate
@@ -198,7 +220,7 @@ namespace StoreAppGuard
         }
 
         // ---- 运行时绘制托盘图标 (绿色对勾=正常, 橙色=修复中) ----
-        private static Icon MakeIcon(Color back, bool check)
+        internal static Icon MakeIcon(Color back, bool check)
         {
             using (Bitmap bmp = new Bitmap(32, 32))
             using (Graphics g = Graphics.FromImage(bmp))
@@ -222,6 +244,182 @@ namespace StoreAppGuard
                 }
                 return Icon.FromHandle(bmp.GetHicon());
             }
+        }
+    }
+
+    // ==================== 内置日志查看器 ====================
+    internal sealed class LogViewerForm : Form
+    {
+        private readonly string logDir;
+        private ComboBox cboFiles;
+        private RichTextBox rtb;
+        private CheckBox chkFollow;
+        private System.Windows.Forms.Timer tmr;
+        private Label lblStatus;
+        private DateTime lastStamp = DateTime.MinValue;
+        private bool loading;
+
+        internal LogViewerForm(string dir)
+        {
+            logDir = dir;
+            Text = "StoreAppGuard 日志";
+            StartPosition = FormStartPosition.CenterScreen;
+            Size = new Size(880, 560);
+            MinimumSize = new Size(560, 320);
+            try { Icon = GuardContext.MakeIcon(Color.FromArgb(46, 160, 67), true); } catch { }
+
+            cboFiles = new ComboBox();
+            cboFiles.DropDownStyle = ComboBoxStyle.DropDownList;
+            cboFiles.Width = 210;
+            cboFiles.SelectedIndexChanged += delegate { lastStamp = DateTime.MinValue; LoadLog(true); };
+
+            Button btnRefresh = new Button();
+            btnRefresh.Text = "刷新";
+            btnRefresh.AutoSize = true;
+            btnRefresh.Click += delegate { LoadFileList(); LoadLog(true); };
+
+            Button btnCopy = new Button();
+            btnCopy.Text = "复制全部";
+            btnCopy.AutoSize = true;
+            btnCopy.Click += delegate { try { Clipboard.SetText(rtb.Text); } catch { } };
+
+            Button btnDir = new Button();
+            btnDir.Text = "打开目录";
+            btnDir.AutoSize = true;
+            btnDir.Click += delegate
+            {
+                try { if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir); Process.Start("explorer.exe", logDir); } catch { }
+            };
+
+            chkFollow = new CheckBox();
+            chkFollow.Text = "自动跟随最新";
+            chkFollow.Checked = true;
+            chkFollow.AutoSize = true;
+
+            FlowLayoutPanel top = new FlowLayoutPanel();
+            top.Dock = DockStyle.Top;
+            top.Height = 42;
+            top.Padding = new Padding(8, 8, 8, 0);
+            top.Controls.AddRange(new Control[] { cboFiles, btnRefresh, btnCopy, btnDir, chkFollow });
+
+            lblStatus = new Label();
+            lblStatus.Dock = DockStyle.Bottom;
+            lblStatus.Height = 26;
+            lblStatus.TextAlign = ContentAlignment.MiddleLeft;
+            lblStatus.Padding = new Padding(8, 0, 0, 0);
+            lblStatus.ForeColor = Color.DimGray;
+            lblStatus.Text = "就绪";
+
+            rtb = new RichTextBox();
+            rtb.Dock = DockStyle.Fill;
+            rtb.ReadOnly = true;
+            rtb.WordWrap = false;
+            rtb.BackColor = Color.White;
+            rtb.Font = new Font("Consolas", 9.5f);
+            rtb.DetectUrls = false;
+
+            Controls.Add(rtb);
+            Controls.Add(top);
+            Controls.Add(lblStatus);
+
+            tmr = new System.Windows.Forms.Timer();
+            tmr.Interval = 3000;
+            tmr.Tick += delegate { LoadLog(false); };
+            tmr.Start();
+
+            Load += delegate { LoadFileList(); };
+            FormClosed += delegate { tmr.Stop(); };
+        }
+
+        // 列出全部日志文件, 新的在前
+        private void LoadFileList()
+        {
+            try
+            {
+                string[] files = Directory.Exists(logDir)
+                    ? Directory.GetFiles(logDir, "guard-*.log") : new string[0];
+                Array.Sort(files, delegate(string a, string b) { return string.CompareOrdinal(b, a); });
+                object keep = cboFiles.SelectedItem;
+                cboFiles.Items.Clear();
+                foreach (string f in files) cboFiles.Items.Add(Path.GetFileName(f));
+                if (cboFiles.Items.Count > 0)
+                {
+                    cboFiles.SelectedIndex = (keep != null && cboFiles.Items.Contains(keep)) ? cboFiles.Items.IndexOf(keep) : 0;
+                }
+                else
+                {
+                    rtb.Text = "";
+                    AppendLine("暂无日志。守护进程运行后, 修复记录会自动出现在这里。", Color.DimGray);
+                    lblStatus.Text = "暂无日志";
+                }
+            }
+            catch (Exception ex) { lblStatus.Text = "读取日志目录失败: " + ex.Message; }
+        }
+
+        private string CurrentPath()
+        {
+            object sel = cboFiles.SelectedItem;
+            return sel == null ? null : Path.Combine(logDir, sel.ToString());
+        }
+
+        // 加载/自动刷新日志 (文件没变化时 3 秒轮询零开销)
+        private void LoadLog(bool force)
+        {
+            if (loading) return;
+            string path = CurrentPath();
+            if (path == null) return;
+            try
+            {
+                DateTime stamp = File.Exists(path) ? File.GetLastWriteTimeUtc(path) : DateTime.MinValue;
+                if (!force && stamp == lastStamp) return;
+                lastStamp = stamp;
+
+                loading = true;
+                rtb.Text = "";
+                AppendLine("日志: " + path, Color.DimGray);
+
+                if (!File.Exists(path)) { AppendLine("(文件不存在)", Color.DimGray); return; }
+
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                int start = 0;
+                if (lines.Length > 3000)
+                {
+                    start = lines.Length - 3000;
+                    AppendLine("(日志较长, 仅显示最后 3000 行; 完整内容请点\"打开目录\"查看)", Color.DimGray);
+                }
+                int shown = 0, okCnt = 0, errCnt = 0;
+                for (int i = start; i < lines.Length; i++)
+                {
+                    string l = lines[i];
+                    if (l.Length == 0) continue;
+                    Color c = Color.Black;
+                    if (l.IndexOf("[ok]") >= 0 || l.IndexOf(">>") >= 0) { c = Color.FromArgb(0, 128, 0); okCnt++; }
+                    else if (l.IndexOf("[x]") >= 0) { c = Color.FromArgb(200, 30, 30); errCnt++; }
+                    else if (l.IndexOf("[!]") >= 0 || l.IndexOf("人工") >= 0) { c = Color.FromArgb(190, 110, 0); }
+                    else if (l.IndexOf("修复") >= 0 || l.IndexOf("事件:") >= 0 || l.IndexOf("巡检") >= 0) { c = Color.FromArgb(0, 90, 160); }
+                    AppendLine(l, c);
+                    shown++;
+                }
+                if (chkFollow.Checked) { rtb.SelectionStart = rtb.TextLength; rtb.ScrollToCaret(); }
+                long kb = new FileInfo(path).Length / 1024;
+                lblStatus.Text = string.Format("共 {0} 行 · 显示 {1} 行 · {2:N0} KB · 成功 {3} 条 · 错误 {4} 条 · 每 3 秒自动刷新",
+                    lines.Length, shown, kb, okCnt, errCnt);
+            }
+            catch (Exception ex)
+            {
+                lblStatus.Text = "读取失败: " + ex.Message;
+            }
+            finally { loading = false; }
+        }
+
+        private void AppendLine(string s, Color c)
+        {
+            rtb.SelectionStart = rtb.TextLength;
+            rtb.SelectionLength = 0;
+            rtb.SelectionColor = c;
+            rtb.AppendText(s);
+            rtb.AppendText("\n");
+            rtb.SelectionColor = Color.Black;
         }
     }
 
