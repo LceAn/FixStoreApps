@@ -11,6 +11,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using System.Xml.Linq;
 using Microsoft.Win32;
 
 // ============================================================
@@ -490,7 +491,9 @@ namespace StoreAppGuard
             grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
             grid.ColumnHeadersHeight = 30;
+            grid.RowTemplate.Height = 34;
             grid.Columns.Add("app", "应用");
+            grid.Columns["app"].FillWeight = 26;
             grid.Columns.Add("state", "状态");
             grid.Columns["state"].FillWeight = 22;
             grid.Columns.Add("rung", "修复级别");
@@ -499,6 +502,16 @@ namespace StoreAppGuard
             grid.Columns["lastfix"].FillWeight = 16;
             grid.Columns.Add("running", "运行中");
             grid.Columns["running"].FillWeight = 10;
+
+            // 图标列 (放最前, 后台异步填充)
+            DataGridViewImageColumn imgCol = new DataGridViewImageColumn(false);
+            imgCol.HeaderText = "";
+            imgCol.Name = "icon";
+            imgCol.Width = 42;
+            imgCol.ImageLayout = DataGridViewImageCellLayout.Zoom;
+            imgCol.SortMode = DataGridViewColumnSortMode.NotSortable;
+            imgCol.DefaultCellStyle.NullValue = null; // 值为 null 时留白, 不画红色错误占位图
+            grid.Columns.Insert(0, imgCol);
 
             Panel gp = new Panel();
             gp.Dock = DockStyle.Fill;
@@ -602,6 +615,117 @@ namespace StoreAppGuard
             SafeInvoke(delegate { chkAuto.Checked = Util.AutoStartEnabled; });
         }
 
+        // ---- 应用图标/友好名称 (后台提取, 缓存) ----
+        private readonly object metaGate = new object();
+        private readonly Dictionary<string, Image> iconCache = new Dictionary<string, Image>();
+        private readonly Dictionary<string, string> nameCache = new Dictionary<string, string>();
+        private readonly HashSet<string> metaPending = new HashSet<string>();
+        private readonly HashSet<string> metaDone = new HashSet<string>();   // 防止失败后无限重试
+
+        // 无 IO 的名称美化回退: MSTeams_8wek -> MSTeams, Microsoft.WindowsTerminal_.. -> WindowsTerminal
+        private static string PrettyName(string family)
+        {
+            string n = family.Split('_')[0];
+            if (n.StartsWith("MicrosoftWindows.")) return n.Substring("MicrosoftWindows.".Length);
+            if (n.StartsWith("Microsoft.")) return n.Substring("Microsoft.".Length);
+            return n;
+        }
+
+        private void QueueMeta(Engine.PkgView v)
+        {
+            lock (metaGate)
+            {
+                if (v.InstallLocation == null || metaDone.Contains(v.Family) || metaPending.Contains(v.Family)) return;
+                metaPending.Add(v.Family);
+            }
+            string fam = v.Family, loc = v.InstallLocation, full = v.FullName;
+            Task.Factory.StartNew(delegate
+            {
+                Image ico = null; string name = null;
+                try { ico = ExtractAppIcon(loc); } catch { }
+                try { name = LookupDisplayName(full, fam); } catch { }
+                lock (metaGate)
+                {
+                    metaPending.Remove(fam);
+                    metaDone.Add(fam);
+                    if (ico != null) iconCache[fam] = ico;
+                    if (name != null) nameCache[fam] = name;
+                }
+                SafeInvoke(RefreshGrid);
+            });
+        }
+
+        // 从包清单找主程序 EXE -> 取它的图标
+        private static Image ExtractAppIcon(string loc)
+        {
+            try
+            {
+                string exe = null;
+                string m1 = Path.Combine(loc, "AppxManifest.xml");
+                string m2 = Path.Combine(loc, "AppxMetadata", "AppxBundleManifest.xml");
+                string manifest = File.Exists(m1) ? m1 : (File.Exists(m2) ? m2 : null);
+                if (manifest != null)
+                {
+                    XDocument x = XDocument.Load(manifest);
+                    foreach (XElement el in x.Descendants())
+                    {
+                        if (el.Name.LocalName != "Application") continue;
+                        XAttribute a = el.Attribute("Executable");
+                        if (a != null && !string.IsNullOrEmpty(a.Value)) { exe = a.Value; break; }
+                    }
+                }
+                if (exe == null)
+                {
+                    string e = null;
+                    foreach (string f in Directory.GetFiles(loc, "*.exe")) { e = f; break; }
+                    if (e != null) exe = Path.GetFileName(e);
+                }
+                if (exe == null) return null;
+                string full = Path.Combine(loc, exe);
+                if (!File.Exists(full)) return null;
+                using (Icon ic = Icon.ExtractAssociatedIcon(full))
+                {
+                    if (ic == null) return null;
+                    using (Bitmap b = ic.ToBitmap())
+                    {
+                        Bitmap small = new Bitmap(b, 24, 24);
+                        small.SetResolution(b.HorizontalResolution, b.VerticalResolution);
+                        return small;
+                    }
+                }
+            }
+            catch { return null; }
+        }
+
+        // 显示名: 系统仓库注册表 -> ms-resource 时回退到包名美化
+        private static string LookupDisplayName(string fullName, string family)
+        {
+            string disp = null;
+            if (!string.IsNullOrEmpty(fullName))
+            {
+                try
+                {
+                    using (RegistryKey k = Registry.ClassesRoot.OpenSubKey(
+                        "Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages\\" + fullName))
+                    {
+                        if (k != null)
+                        {
+                            object v = k.GetValue("DisplayName");
+                            if (v != null) disp = v.ToString();
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (string.IsNullOrEmpty(disp) || disp.StartsWith("ms-resource") || disp.StartsWith("@{")) disp = null;
+            if (disp != null) return disp;
+            // 回退: 包族名前段, 去掉 Microsoft. 前缀
+            string n = family.Split('_')[0];
+            if (n.StartsWith("Microsoft.")) n = n.Substring("Microsoft.".Length);
+            if (n.StartsWith("MicrosoftWindows.")) n = n.Substring("MicrosoftWindows.".Length);
+            return n;
+        }
+
         private void RefreshGrid()
         {
             try
@@ -638,10 +762,20 @@ namespace StoreAppGuard
                         }
                     }
 
+                    Image ico = null; string name;
+                    lock (metaGate)
+                    {
+                        iconCache.TryGetValue(v.Family, out ico);
+                        if (!nameCache.TryGetValue(v.Family, out name)) name = PrettyName(v.Family);
+                    }
+                    QueueMeta(v); // 没有图标时后台补
+
                     string lastfix = v.LastRepair == DateTime.MinValue ? "-" : v.LastRepair.ToString("MM-dd HH:mm");
-                    int i = grid.Rows.Add(v.Family, status, v.Rung == 0 ? "-" : "第" + v.Rung + "级", lastfix, run);
-                    grid.Rows[i].Cells[1].Style.ForeColor = c;
-                    grid.Rows[i].Cells[4].Style.ForeColor = run == "●" ? Color.Green : Color.DimGray;
+                    int i = grid.Rows.Add(ico, name, status, v.Rung == 0 ? "-" : "第" + v.Rung + "级", lastfix, run);
+                    grid.Rows[i].Cells[1].ToolTipText = v.Family; // 悬停看包族名
+                    grid.Rows[i].Cells[1].Style.ForeColor = Color.FromArgb(30, 30, 30);
+                    grid.Rows[i].Cells[2].Style.ForeColor = c;
+                    grid.Rows[i].Cells[5].Style.ForeColor = run == "●" ? Color.Green : Color.DimGray;
                     if (v.ManualUntil == DateTime.MaxValue) grid.Rows[i].DefaultCellStyle.ForeColor = Color.Gray;
                 }
                 grid.ClearSelection();
@@ -920,6 +1054,7 @@ namespace StoreAppGuard
             internal DateTime ManualUntil = DateTime.MinValue;
             internal bool NotifiedManual;
             internal string InstallLocation;   // 缓存安装目录, 供 UI 判断"运行中"
+            internal string FullName;          // 包全名, 供 UI 查显示名/图标
         }
 
         // UI 快照 DTO
@@ -927,6 +1062,7 @@ namespace StoreAppGuard
         {
             internal string Family;
             internal string InstallLocation;
+            internal string FullName;
             internal int Rung;
             internal DateTime LastRepair, LastFailure, ManualUntil;
             internal bool NotifiedManual;
@@ -947,6 +1083,7 @@ namespace StoreAppGuard
                     v.ManualUntil = kv.Value.ManualUntil;
                     v.NotifiedManual = kv.Value.NotifiedManual;
                     v.InstallLocation = kv.Value.InstallLocation;
+                    v.FullName = kv.Value.FullName;
                     r.Add(v);
                 }
                 return r;
@@ -973,7 +1110,49 @@ namespace StoreAppGuard
             // 启动 20 秒后补一次启动期扫描(近1天), 之后每 5 分钟轮询兜底(近6分钟)
             startTimer = new System.Threading.Timer(delegate { RunSweepMinutes(60 * 24); startTimer.Dispose(); }, null, 20000, Timeout.Infinite);
             pollTimer = new System.Threading.Timer(delegate { RunSweepMinutes(6); }, null, 90000, 300000);
+            // 3 秒后异步补全在册应用的 安装位置/包全名 (UI 图标/友好名依赖)
+            System.Threading.Timer hyd = null;
+            hyd = new System.Threading.Timer(delegate
+            {
+                hyd.Dispose();
+                try { HydrateLocations(); } catch { }
+            }, null, 3000, Timeout.Infinite);
             WriteLog("[ok] 守护启动, 事件监听 + 周期巡检已就绪");
+        }
+
+        // 一次性查询全部在册应用的位置/全名补进状态库 (UI 图标/名称依赖)
+        internal void HydrateLocations()
+        {
+            List<string> fams;
+            lock (gate) { fams = states.Keys.ToList(); }
+            if (fams.Count == 0) return;
+            StringBuilder fl = new StringBuilder("@('");
+            fl.Append(string.Join("','", fams.ToArray()));
+            fl.Append("')");
+            string script =
+                "$want = " + fl.ToString() + "; "
+                + "Get-AppxPackage | Where-Object { $want -contains $_.PackageFamilyName } | ForEach-Object { "
+                + "  \"$($_.PackageFamilyName)`t$($_.InstallLocation)`t$($_.PackageFullName)\" }";
+            List<string> lines = PsLines(script, 120);
+            if (lines == null) return;
+            int n = 0;
+            lock (gate)
+            {
+                foreach (string line in lines)
+                {
+                    string[] p = line.Trim().Split('\t');
+                    if (p.Length < 3) continue;
+                    PkgState st;
+                    if (!states.TryGetValue(p[0], out st)) continue;
+                    if (st.InstallLocation == null && p[1].Length > 0) { st.InstallLocation = p[1]; n++; }
+                    if (st.FullName == null && p[2].Length > 0) st.FullName = p[2];
+                }
+            }
+            if (n > 0)
+            {
+                WriteLog("[ok] 已补全 " + n + " 个应用的安装位置 (供界面显示图标/名称)");
+                SaveState();
+            }
         }
 
         internal void Stop()
@@ -1147,7 +1326,7 @@ namespace StoreAppGuard
                 string loc = info[0].Trim();
                 string fullname = info.Count > 1 ? info[1].Trim() : fam;
                 bool framework = info.Count > 2 && info[2].Trim() == "FRAMEWORK";
-                GetState(fam).InstallLocation = loc; // 缓存给 UI 用
+                PkgState stInfo = GetState(fam); stInfo.InstallLocation = loc; stInfo.FullName = fullname; // 缓存给 UI 用
                 if (framework)
                 {
                     WriteLog("跳过 " + fam + " : 框架包, 不适用应用修复");
@@ -1161,6 +1340,7 @@ namespace StoreAppGuard
                 if (rc > 0)
                 {
                     WriteLog("[ok] " + fam + " 当前有进程在运行, 视为健康, 不修复");
+                    SaveState(); // 持久化 FullName/InstallLocation 供 UI 使用
                     return;
                 }
 
@@ -1387,6 +1567,7 @@ namespace StoreAppGuard
                         if (t2 > 0) st.ManualUntil = new DateTime(t2);
                         if (p.Length > 4 && p[4] == "1") st.NotifiedManual = true;
                         if (p.Length > 5 && p[5].Length > 0) st.InstallLocation = p[5];
+                        if (p.Length > 6 && p[6].Length > 0) st.FullName = p[6];
                         states[p[0]] = st;
                     }
                 }
@@ -1404,7 +1585,8 @@ namespace StoreAppGuard
                     foreach (KeyValuePair<string, PkgState> kv in states)
                         sb.AppendLine(kv.Key + "\t" + kv.Value.Rung + "\t" + kv.Value.LastRepair.Ticks + "\t"
                             + kv.Value.ManualUntil.Ticks + "\t" + (kv.Value.NotifiedManual ? "1" : "0")
-                            + "\t" + (kv.Value.InstallLocation == null ? "" : kv.Value.InstallLocation));
+                            + "\t" + (kv.Value.InstallLocation == null ? "" : kv.Value.InstallLocation)
+                            + "\t" + (kv.Value.FullName == null ? "" : kv.Value.FullName));
                     File.WriteAllText(StatePath, sb.ToString(), Utf8NoBom);
                 }
                 catch { }

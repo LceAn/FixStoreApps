@@ -13,7 +13,7 @@ if not exist "%CSC%" (
 )
 "%CSC%" /nologo /target:winexe /platform:anycpu /optimize+ /codepage:65001 ^
   /out:"%~dp0StoreAppGuard.exe" ^
-  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll ^
+  /r:System.dll /r:System.Core.dll /r:System.Drawing.dll /r:System.Windows.Forms.dll /r:System.Xml.dll /r:System.Xml.Linq.dll ^
   "%~dp0StoreAppGuard.cs"
 if errorlevel 1 (
     echo [ERROR] build failed
