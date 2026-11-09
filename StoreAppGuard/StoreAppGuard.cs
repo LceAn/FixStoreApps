@@ -31,15 +31,25 @@ namespace StoreAppGuard
         private static extern bool AttachConsole(uint dwProcessId);
         private const uint ATTACH_PARENT_PROCESS = 0xFFFFFFFF;
 
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr FindWindow(string cls, string title);
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        internal const string MainTitle = "商店应用守护 - StoreAppGuard";
+
         [STAThread]
         internal static void Main(string[] args)
         {
             // ---- 命令行模式 ----
-            bool once = false, viewerOnly = false; int days = 3;
+            bool once = false, viewerOnly = false, showOnly = false; int days = 3;
             for (int i = 0; i < args.Length; i++)
             {
                 if (args[i] == "--once" || args[i] == "/once") once = true;
                 if (args[i] == "--logviewer" || args[i] == "/logviewer") viewerOnly = true;
+                if (args[i] == "--show" || args[i] == "/show") showOnly = true;
                 if ((args[i] == "--days" || args[i] == "/days") && i + 1 < args.Length)
                 {
                     int d; if (int.TryParse(args[i + 1], out d) && d > 0 && d <= 365) days = d;
@@ -59,6 +69,16 @@ namespace StoreAppGuard
                 Application.Run(new LogViewerForm(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs")));
                 return;
             }
+            if (showOnly) // 已有实例在跑: 唤起它的主窗口后退出
+            {
+                IntPtr h = FindWindow(null, MainTitle);
+                if (h != IntPtr.Zero)
+                {
+                    ShowWindow(h, 9); // SW_RESTORE
+                    SetForegroundWindow(h);
+                }
+                return;
+            }
 
             // ---- 常驻模式: 单实例 + 托盘 ----
             bool createdNew;
@@ -71,7 +91,51 @@ namespace StoreAppGuard
         }
     }
 
-    // ==================== 托盘上下文 ====================
+    // ==================== 公共工具 ====================
+    internal static class Util
+    {
+        // ---- 开机自启 (HKCU Run, 无需管理员) ----
+        internal const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        internal const string RunName = "StoreAppGuard";
+
+        internal static bool AutoStartEnabled
+        {
+            get
+            {
+                try
+                {
+                    using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey))
+                    {
+                        if (k == null) return false;
+                        object v = k.GetValue(RunName);
+                        return v != null && File.Exists(v.ToString().Trim('"'));
+                    }
+                }
+                catch { return false; }
+            }
+        }
+
+        internal static void SetAutoStart(bool on)
+        {
+            using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RunKey))
+            {
+                if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
+                else k.DeleteValue(RunName, false);
+            }
+        }
+
+        internal static void OpenDir(string dir)
+        {
+            try
+            {
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                Process.Start("explorer.exe", dir);
+            }
+            catch { }
+        }
+    }
+
+    // ==================== 托盘 + 主窗口 上下文 ====================
     internal sealed class GuardContext : ApplicationContext
     {
         private readonly NotifyIcon tray;
@@ -79,7 +143,9 @@ namespace StoreAppGuard
         private readonly Engine engine;
         private readonly Icon icoGreen, icoOrange;
         private readonly ToolStripMenuItem miAutoStart;
-        private LogViewerForm viewer;   // 日志窗口单例
+        private readonly MainForm mainForm;
+        private LogViewerForm viewer;   // 独立日志窗口单例
+        private bool hiddenTipShown;
 
         internal GuardContext()
         {
@@ -90,38 +156,77 @@ namespace StoreAppGuard
             engine = new Engine(UiNotify);
             engine.BusyChanged += Engine_BusyChanged;
 
+            mainForm = new MainForm(engine, this);
+
             var menu = new ContextMenuStrip();
+            menu.Items.Add(new ToolStripMenuItem("显示主界面", null, delegate { ShowMain(); }));
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("立即检查修复", null, delegate { RunBg(delegate { engine.RunSweepOnce(3); }, "手动扫描"); }));
             menu.Items.Add(new ToolStripMenuItem("查看日志", null, delegate { ShowViewer(); }));
-            menu.Items.Add(new ToolStripMenuItem("打开日志目录", null, delegate { TryOpenDir(engine.LogDir); }));
+            menu.Items.Add(new ToolStripMenuItem("打开日志目录", null, delegate { Util.OpenDir(engine.LogDir); }));
             miAutoStart = new ToolStripMenuItem("开机自动启动", null, MenuAutoStartToggle);
-            miAutoStart.Checked = AutoStartEnabled;
+            miAutoStart.Checked = Util.AutoStartEnabled;
             menu.Items.Add(miAutoStart);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("关于 StoreAppGuard", null, delegate {
-                MessageBox.Show("商店应用守护进程 StoreAppGuard v1.0\r\n\r\n"
+                MessageBox.Show("商店应用守护进程 StoreAppGuard v1.2\r\n\r\n"
                     + "实时监听商店应用激活失败事件, 自动执行修复阶梯:\r\n"
                     + "  1. 重注册  2. 重建数据目录+重注册  3. 重置应用\r\n"
                     + "三级无效时通知人工重装 (24 小时内不再自动尝试)。\r\n\r\n"
+                    + "关闭窗口 = 最小化到托盘继续守护; 右键托盘图标可退出。\r\n\r\n"
                     + "源码: https://github.com/LceAn/FixStoreApps",
                     "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }));
-            menu.Items.Add(new ToolStripMenuItem("退出", null, delegate {
-                engine.Stop();
-                tray.Visible = false;
-                ExitThread();
-            }));
+            menu.Items.Add(new ToolStripMenuItem("退出", null, delegate { ExitAll(); }));
 
             tray = new NotifyIcon();
             tray.Icon = icoGreen;
             tray.Text = "商店应用守护 - 运行中";
             tray.ContextMenuStrip = menu;
             tray.Visible = true;
-            tray.DoubleClick += delegate { RunBg(delegate { engine.RunSweepOnce(3); }, "手动扫描"); };
+            tray.DoubleClick += delegate { ShowMain(); };
 
             engine.Start();
-            tray.ShowBalloonTip(4000, "商店应用守护已启动",
-                "正在后台监听商店应用故障, 发现问题会自动修复并提示。", ToolTipIcon.Info);
+            mainForm.Show();
+        }
+
+        internal void ShowMain()
+        {
+            if (mainForm.IsDisposed) return;
+            if (!mainForm.Visible) mainForm.Show();
+            mainForm.Activate();
+        }
+
+        // 主窗口 X 按钮 -> 隐藏到托盘继续守护
+        internal void HideToTray()
+        {
+            mainForm.Hide();
+            if (!hiddenTipShown)
+            {
+                hiddenTipShown = true;
+                tray.ShowBalloonTip(4000, "仍在后台守护",
+                    "窗口已最小化到托盘, 商店应用故障监控与自动修复继续运行。双击托盘图标可重新打开。", ToolTipIcon.Info);
+            }
+        }
+
+        internal void ExitAll()
+        {
+            engine.Stop();
+            if (mainForm != null && !mainForm.IsDisposed) mainForm.RealClose = true;
+            try { if (viewer != null && !viewer.IsDisposed) viewer.Close(); } catch { }
+            tray.Visible = false;
+            ExitThread();
+        }
+
+        internal void ShowViewer()
+        {
+            try
+            {
+                if (viewer != null && !viewer.IsDisposed) { viewer.Show(); viewer.Activate(); return; }
+                viewer = new LogViewerForm(engine.LogDir);
+                viewer.Show();
+            }
+            catch (Exception ex) { MessageBox.Show(ex.Message, "打开日志失败"); }
         }
 
         private void Engine_BusyChanged(bool busy)
@@ -154,18 +259,6 @@ namespace StoreAppGuard
             catch { }
         }
 
-        // 打开内置日志查看器 (已打开则置前)
-        private void ShowViewer()
-        {
-            try
-            {
-                if (viewer != null && !viewer.IsDisposed) { viewer.Show(); viewer.Activate(); return; }
-                viewer = new LogViewerForm(engine.LogDir);
-                viewer.Show();
-            }
-            catch (Exception ex) { MessageBox.Show(ex.Message, "打开日志失败"); }
-        }
-
         private void RunBg(Action a, string what)
         {
             Task.Factory.StartNew(delegate
@@ -175,48 +268,12 @@ namespace StoreAppGuard
             });
         }
 
-        private static void TryOpenDir(string dir)
-        {
-            try
-            {
-                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                Process.Start("explorer.exe", dir);
-            }
-            catch { }
-        }
-
-        // ---- 开机自启 (HKCU Run, 无需管理员) ----
-        private const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
-        private const string RunName = "StoreAppGuard";
-        private static bool AutoStartEnabled
-        {
-            get
-            {
-                try
-                {
-                    using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKey))
-                    {
-                        if (k == null) return false;
-                        object v = k.GetValue(RunName);
-                        return v != null && File.Exists(v.ToString());
-                    }
-                }
-                catch { return false; }
-            }
-        }
-
         private void MenuAutoStartToggle(object s, EventArgs e)
         {
-            try
-            {
-                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RunKey))
-                {
-                    if (miAutoStart.Checked) k.DeleteValue(RunName, false);
-                    else k.SetValue(RunName, "\"" + Application.ExecutablePath + "\"");
-                }
-            }
+            try { Util.SetAutoStart(!miAutoStart.Checked); }
             catch (Exception ex) { MessageBox.Show(ex.Message, "设置失败"); }
-            miAutoStart.Checked = AutoStartEnabled;
+            miAutoStart.Checked = Util.AutoStartEnabled;
+            mainForm.SyncAutoStart();
         }
 
         // ---- 运行时绘制托盘图标 (绿色对勾=正常, 橙色=修复中) ----
@@ -244,6 +301,397 @@ namespace StoreAppGuard
                 }
                 return Icon.FromHandle(bmp.GetHicon());
             }
+        }
+    }
+
+    // ==================== 主窗口 ====================
+    internal sealed class MainForm : Form
+    {
+        private readonly Engine engine;
+        private readonly GuardContext owner;
+        private readonly Icon icoGreen, icoOrange;
+
+        private Label lblDot, lblTitle, lblSub;
+        private DataGridView grid;
+        private RichTextBox rtb;
+        private CheckBox chkAuto;
+        private Button btnSweep, btnViewer, btnExit;
+        private ToolStripStatusLabel stripLbl;
+        private System.Windows.Forms.Timer uiTimer;
+        private DateTime logStamp = DateTime.MinValue;
+        private int gridTick;
+        internal bool RealClose; // true = 真退出, 否则关窗=隐藏到托盘
+
+        internal MainForm(Engine eng, GuardContext own)
+        {
+            engine = eng;
+            owner = own;
+            icoGreen = GuardContext.MakeIcon(Color.FromArgb(46, 160, 67), true);
+            icoOrange = GuardContext.MakeIcon(Color.FromArgb(230, 140, 30), false);
+
+            Text = Program.MainTitle;
+            StartPosition = FormStartPosition.CenterScreen;
+            Size = new Size(980, 640);
+            MinimumSize = new Size(720, 460);
+            Icon = icoGreen;
+
+            BuildTopBar();
+            BuildGrid();
+            BuildLogPanel();
+            BuildStrip();
+            BuildBottomBar();
+
+            // 引擎事件 -> UI 线程刷新
+            engine.BusyChanged += delegate(bool busy)
+            {
+                SafeInvoke(delegate { ApplyBusy(busy); });
+            };
+            engine.StateChanged += delegate
+            {
+                SafeInvoke(delegate { RefreshGrid(); });
+            };
+
+            uiTimer = new System.Windows.Forms.Timer();
+            uiTimer.Interval = 2000;
+            uiTimer.Tick += delegate
+            {
+                LoadTail();
+                gridTick++;
+                if (gridTick >= 5) { gridTick = 0; RefreshGrid(); } // 每 10 秒刷一次应用状态
+                SyncStrip();
+            };
+            uiTimer.Start();
+
+            Load += delegate { RefreshGrid(); LoadTail(); SyncStrip(); };
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (!RealClose) { e.Cancel = true; owner.HideToTray(); }
+            };
+        }
+
+        private void SafeInvoke(MethodInvoker a)
+        {
+            try
+            {
+                if (IsDisposed) return;
+                if (InvokeRequired) BeginInvoke(a);
+                else a();
+            }
+            catch { }
+        }
+
+        // ---- 顶部状态栏 ----
+        private void BuildTopBar()
+        {
+            Panel top = new Panel();
+            top.Dock = DockStyle.Top;
+            top.Height = 64;
+            top.Padding = new Padding(14, 8, 14, 6);
+            top.Paint += delegate(object s, PaintEventArgs e)
+            {
+                e.Graphics.DrawLine(Pens.Gainsboro, 0, top.Height - 1, top.Width, top.Height - 1);
+            };
+
+            lblDot = new Label();
+            lblDot.Text = "●";
+            lblDot.Font = new Font("Microsoft YaHei UI", 22f, FontStyle.Bold);
+            lblDot.ForeColor = Color.FromArgb(46, 160, 67);
+            lblDot.AutoSize = true;
+            lblDot.Location = new Point(16, 8);
+
+            lblTitle = new Label();
+            lblTitle.Text = "商店应用守护";
+            lblTitle.Font = new Font("Microsoft YaHei UI", 13f, FontStyle.Bold);
+            lblTitle.AutoSize = true;
+            lblTitle.Location = new Point(66, 10);
+
+            lblSub = new Label();
+            lblSub.Text = "监控中 · 等待事件";
+            lblSub.Font = new Font("Microsoft YaHei UI", 9.5f);
+            lblSub.ForeColor = Color.DimGray;
+            lblSub.AutoSize = true;
+            lblSub.Location = new Point(68, 36);
+
+            btnSweep = new Button();
+            btnSweep.Text = "立即检查修复";
+            btnSweep.Width = 112;
+            btnSweep.Height = 30;
+            btnSweep.Top = 16;
+
+            chkAuto = new CheckBox();
+            chkAuto.Text = "开机自启";
+            chkAuto.Width = 84;
+            chkAuto.Height = 30;
+            chkAuto.Top = 18;
+
+            top.Controls.Add(lblDot);
+            top.Controls.Add(lblTitle);
+            top.Controls.Add(lblSub);
+            top.Controls.Add(btnSweep);
+            top.Controls.Add(chkAuto);
+            top.Resize += delegate
+            {
+                chkAuto.Left = top.Width - chkAuto.Width - 16;
+                btnSweep.Left = chkAuto.Left - btnSweep.Width - 10;
+            };
+
+            btnSweep.Click += delegate
+            {
+                btnSweep.Enabled = false;
+                lblSub.Text = "正在扫描最近 3 天记录 ...";
+                Task.Factory.StartNew(delegate
+                {
+                    try { engine.RunSweepOnce(3); }
+                    catch { }
+                    SafeInvoke(delegate { btnSweep.Enabled = true; });
+                });
+            };
+            chkAuto.CheckedChanged += delegate
+            {
+                try { Util.SetAutoStart(chkAuto.Checked); }
+                catch (Exception ex) { MessageBox.Show(ex.Message, "设置失败"); }
+                chkAuto.Checked = Util.AutoStartEnabled;
+            };
+            chkAuto.Checked = Util.AutoStartEnabled;
+
+            Controls.Add(top);
+        }
+
+        private void ApplyBusy(bool busy)
+        {
+            lblDot.ForeColor = busy ? Color.FromArgb(230, 140, 30) : Color.FromArgb(46, 160, 67);
+            lblSub.Text = busy ? "正在修复 ..." : "监控中 · 等待事件";
+            Icon = busy ? icoOrange : icoGreen;
+        }
+
+        // ---- 应用状态表格 ----
+        private void BuildGrid()
+        {
+            Label cap = new Label();
+            cap.Text = "  监控中的应用 (出现过的故障与修复状态)";
+            cap.Dock = DockStyle.Top;
+            cap.Height = 26;
+            cap.TextAlign = ContentAlignment.MiddleLeft;
+            cap.BackColor = Color.WhiteSmoke;
+            cap.ForeColor = Color.DimGray;
+
+            grid = new DataGridView();
+            grid.Dock = DockStyle.Fill;
+            grid.ReadOnly = true;
+            grid.AllowUserToAddRows = false;
+            grid.AllowUserToDeleteRows = false;
+            grid.AllowUserToResizeRows = false;
+            grid.RowHeadersVisible = false;
+            grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+            grid.BackgroundColor = Color.White;
+            grid.BorderStyle = BorderStyle.None;
+            grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+            grid.GridColor = Color.Gainsboro;
+            grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+            grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+            grid.ColumnHeadersHeight = 30;
+            grid.Columns.Add("app", "应用");
+            grid.Columns.Add("state", "状态");
+            grid.Columns["state"].FillWeight = 22;
+            grid.Columns.Add("rung", "修复级别");
+            grid.Columns["rung"].FillWeight = 12;
+            grid.Columns.Add("lastfix", "上次修复");
+            grid.Columns["lastfix"].FillWeight = 16;
+            grid.Columns.Add("running", "运行中");
+            grid.Columns["running"].FillWeight = 10;
+
+            Panel gp = new Panel();
+            gp.Dock = DockStyle.Fill;
+            gp.Padding = new Padding(14, 4, 14, 2);
+            gp.Controls.Add(grid);
+            gp.Controls.Add(cap); // dock 顺序: 后加的 Top 在内层
+
+            split = new SplitContainer();
+            split.Dock = DockStyle.Fill;
+            split.Orientation = Orientation.Horizontal;
+            split.SplitterDistance = 220;
+            split.Panel1.Controls.Add(gp);
+            Controls.Add(split);
+            split.BringToFront();
+        }
+
+        private SplitContainer split;
+
+        // ---- 实时日志面板 ----
+        private void BuildLogPanel()
+        {
+            Label cap = new Label();
+            cap.Text = "  实时日志";
+            cap.Dock = DockStyle.Top;
+            cap.Height = 26;
+            cap.TextAlign = ContentAlignment.MiddleLeft;
+            cap.BackColor = Color.WhiteSmoke;
+            cap.ForeColor = Color.DimGray;
+
+            rtb = new RichTextBox();
+            rtb.Dock = DockStyle.Fill;
+            rtb.ReadOnly = true;
+            rtb.WordWrap = false;
+            rtb.BackColor = Color.White;
+            rtb.Font = new Font("Consolas", 9f);
+            rtb.DetectUrls = false;
+            rtb.BorderStyle = BorderStyle.None;
+
+            Panel lp = new Panel();
+            lp.Dock = DockStyle.Fill;
+            lp.Padding = new Padding(14, 2, 14, 6);
+            lp.Controls.Add(rtb);
+            lp.Controls.Add(cap);
+
+            split.Panel2.Controls.Add(lp);
+        }
+
+        // ---- 底部按钮栏 + 状态条 ----
+        private void BuildStrip()
+        {
+            StatusStrip strip = new StatusStrip();
+            stripLbl = new ToolStripStatusLabel("就绪");
+            strip.Items.Add(stripLbl);
+            Controls.Add(strip);
+        }
+
+        private void BuildBottomBar()
+        {
+            FlowLayoutPanel bar = new FlowLayoutPanel();
+            bar.Dock = DockStyle.Bottom;
+            bar.Height = 46;
+            bar.FlowDirection = FlowDirection.LeftToRight;
+            bar.Padding = new Padding(14, 8, 14, 4);
+
+            btnViewer = new Button();
+            btnViewer.Text = "独立日志窗口";
+            btnViewer.AutoSize = true;
+            btnViewer.Padding = new Padding(6, 2, 6, 2);
+            btnViewer.Click += delegate { owner.ShowViewer(); };
+
+            Button btnDir = new Button();
+            btnDir.Text = "打开日志目录";
+            btnDir.AutoSize = true;
+            btnDir.Padding = new Padding(6, 2, 6, 2);
+            btnDir.Click += delegate { Util.OpenDir(engine.LogDir); };
+
+            btnExit = new Button();
+            btnExit.Text = "退出守护";
+            btnExit.AutoSize = true;
+            btnExit.Padding = new Padding(6, 2, 6, 2);
+            btnExit.ForeColor = Color.Firebrick;
+            btnExit.Click += delegate { owner.ExitAll(); };
+
+            Label hint = new Label();
+            hint.Text = "关闭窗口 = 最小化到托盘, 守护不中断";
+            hint.AutoSize = true;
+            hint.ForeColor = Color.DimGray;
+            hint.Padding = new Padding(14, 6, 0, 0);
+
+            bar.Controls.Add(btnViewer);
+            bar.Controls.Add(btnDir);
+            bar.Controls.Add(btnExit);
+            bar.Controls.Add(hint);
+            Controls.Add(bar);
+        }
+
+        // ---- 刷新逻辑 ----
+
+        internal void SyncAutoStart()
+        {
+            SafeInvoke(delegate { chkAuto.Checked = Util.AutoStartEnabled; });
+        }
+
+        private void RefreshGrid()
+        {
+            try
+            {
+                List<Engine.PkgView> snap = engine.GetStateSnapshot();
+                Process[] procs = Process.GetProcesses();
+                DateTime now = DateTime.Now;
+                grid.Rows.Clear();
+                int todayFix = 0;
+                foreach (Engine.PkgView v in snap)
+                {
+                    if (v.LastRepair.Date == now.Date) todayFix++;
+
+                    string status; Color c;
+                    if (v.ManualUntil == DateTime.MaxValue) { status = "已忽略(残留记录)"; c = Color.Gray; }
+                    else if (v.ManualUntil > now) { status = "待人工处理 至 " + v.ManualUntil.ToString("MM-dd HH:mm"); c = Color.Firebrick; }
+                    else if (v.LastRepair != DateTime.MinValue && now - v.LastRepair < TimeSpan.FromMinutes(15)) { status = "修复冷却中"; c = Color.DarkOrange; }
+                    else if (v.Rung > 0) { status = "监控中·已修" + v.Rung + "级"; c = Color.Green; }
+                    else { status = "监控中"; c = Color.Green; }
+
+                    string run = "-";
+                    if (v.InstallLocation != null)
+                    {
+                        foreach (Process p in procs)
+                        {
+                            bool hit = false;
+                            try
+                            {
+                                if (p.MainModule != null && p.MainModule.FileName != null
+                                    && p.MainModule.FileName.StartsWith(v.InstallLocation, StringComparison.OrdinalIgnoreCase)) hit = true;
+                            }
+                            catch { } // 系统/提权进程读不到 MainModule, 忽略
+                            if (hit) { run = "●"; break; }
+                        }
+                    }
+
+                    string lastfix = v.LastRepair == DateTime.MinValue ? "-" : v.LastRepair.ToString("MM-dd HH:mm");
+                    int i = grid.Rows.Add(v.Family, status, v.Rung == 0 ? "-" : "第" + v.Rung + "级", lastfix, run);
+                    grid.Rows[i].Cells[1].Style.ForeColor = c;
+                    grid.Rows[i].Cells[4].Style.ForeColor = run == "●" ? Color.Green : Color.DimGray;
+                    if (v.ManualUntil == DateTime.MaxValue) grid.Rows[i].DefaultCellStyle.ForeColor = Color.Gray;
+                }
+                grid.ClearSelection();
+                curTodayFix = todayFix;
+                curWatched = snap.Count;
+            }
+            catch { }
+        }
+
+        private int curTodayFix, curWatched;
+
+        private void SyncStrip()
+        {
+            stripLbl.Text = string.Format("今日修复 {0} 次 · 监控 {1} 个应用 · 事件监听 + 每 5 分钟巡检 · v1.2",
+                curTodayFix, curWatched);
+        }
+
+        // 尾随今天日志的最后 400 行
+        private void LoadTail()
+        {
+            try
+            {
+                string path = Path.Combine(engine.LogDir, "guard-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
+                if (!File.Exists(path)) return;
+                DateTime stamp = File.GetLastWriteTimeUtc(path);
+                if (stamp == logStamp) return;
+                logStamp = stamp;
+
+                rtb.Text = "";
+                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
+                int start = Math.Max(0, lines.Length - 400);
+                for (int i = start; i < lines.Length; i++)
+                {
+                    string l = lines[i];
+                    if (l.Length == 0) continue;
+                    Color c = Color.Black;
+                    if (l.IndexOf("[ok]") >= 0) c = Color.FromArgb(0, 128, 0);
+                    else if (l.IndexOf("[x]") >= 0) c = Color.FromArgb(200, 30, 30);
+                    else if (l.IndexOf("[!]") >= 0 || l.IndexOf("人工") >= 0) c = Color.FromArgb(190, 110, 0);
+                    else if (l.IndexOf("修复") >= 0 || l.IndexOf("事件:") >= 0 || l.IndexOf("巡检") >= 0) c = Color.FromArgb(0, 90, 160);
+                    rtb.SelectionStart = rtb.TextLength;
+                    rtb.SelectionLength = 0;
+                    rtb.SelectionColor = c;
+                    rtb.AppendText(l + "\n");
+                }
+                rtb.SelectionColor = Color.Black;
+                rtb.SelectionStart = rtb.TextLength;
+                rtb.ScrollToCaret();
+            }
+            catch { }
         }
     }
 
@@ -456,6 +904,13 @@ namespace StoreAppGuard
         }
 
         internal event Action<bool> BusyChanged;
+        internal event Action<string> LogLine;    // 每条日志 (后台线程触发)
+        internal event Action StateChanged;       // 状态文件变化 (后台线程触发)
+
+        internal bool IsBusy
+        {
+            get { lock (gate) { return busy; } }
+        }
 
         private sealed class PkgState
         {
@@ -464,6 +919,38 @@ namespace StoreAppGuard
             internal DateTime LastFailure = DateTime.MinValue;
             internal DateTime ManualUntil = DateTime.MinValue;
             internal bool NotifiedManual;
+            internal string InstallLocation;   // 缓存安装目录, 供 UI 判断"运行中"
+        }
+
+        // UI 快照 DTO
+        internal sealed class PkgView
+        {
+            internal string Family;
+            internal string InstallLocation;
+            internal int Rung;
+            internal DateTime LastRepair, LastFailure, ManualUntil;
+            internal bool NotifiedManual;
+        }
+
+        internal List<PkgView> GetStateSnapshot()
+        {
+            lock (gate)
+            {
+                List<PkgView> r = new List<PkgView>();
+                foreach (KeyValuePair<string, PkgState> kv in states)
+                {
+                    PkgView v = new PkgView();
+                    v.Family = kv.Key;
+                    v.Rung = kv.Value.Rung;
+                    v.LastRepair = kv.Value.LastRepair;
+                    v.LastFailure = kv.Value.LastFailure;
+                    v.ManualUntil = kv.Value.ManualUntil;
+                    v.NotifiedManual = kv.Value.NotifiedManual;
+                    v.InstallLocation = kv.Value.InstallLocation;
+                    r.Add(v);
+                }
+                return r;
+            }
         }
 
         internal Engine(Action<string, string, string> notifyCb)
@@ -660,6 +1147,7 @@ namespace StoreAppGuard
                 string loc = info[0].Trim();
                 string fullname = info.Count > 1 ? info[1].Trim() : fam;
                 bool framework = info.Count > 2 && info[2].Trim() == "FRAMEWORK";
+                GetState(fam).InstallLocation = loc; // 缓存给 UI 用
                 if (framework)
                 {
                     WriteLog("跳过 " + fam + " : 框架包, 不适用应用修复");
@@ -898,6 +1386,7 @@ namespace StoreAppGuard
                         if (t1 > 0) st.LastRepair = new DateTime(t1);
                         if (t2 > 0) st.ManualUntil = new DateTime(t2);
                         if (p.Length > 4 && p[4] == "1") st.NotifiedManual = true;
+                        if (p.Length > 5 && p[5].Length > 0) st.InstallLocation = p[5];
                         states[p[0]] = st;
                     }
                 }
@@ -914,11 +1403,14 @@ namespace StoreAppGuard
                     StringBuilder sb = new StringBuilder();
                     foreach (KeyValuePair<string, PkgState> kv in states)
                         sb.AppendLine(kv.Key + "\t" + kv.Value.Rung + "\t" + kv.Value.LastRepair.Ticks + "\t"
-                            + kv.Value.ManualUntil.Ticks + "\t" + (kv.Value.NotifiedManual ? "1" : "0"));
+                            + kv.Value.ManualUntil.Ticks + "\t" + (kv.Value.NotifiedManual ? "1" : "0")
+                            + "\t" + (kv.Value.InstallLocation == null ? "" : kv.Value.InstallLocation));
                     File.WriteAllText(StatePath, sb.ToString(), Utf8NoBom);
                 }
                 catch { }
             }
+            Action h = StateChanged;
+            if (h != null) { try { h(); } catch { } }
         }
 
         // ---------------- 其他 ----------------
@@ -949,6 +1441,8 @@ namespace StoreAppGuard
             }
             catch { }
             try { Console.WriteLine(line); } catch { }
+            Action<string> hl = LogLine;
+            if (hl != null) { try { hl(line); } catch { } }
         }
 
         private static readonly Encoding Utf8Bom = new UTF8Encoding(true);

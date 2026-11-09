@@ -49,8 +49,10 @@
 
 ## 后台守护进程 StoreAppGuard（NEW）
 
-不想每次手动点？`StoreAppGuard.exe` 常驻后台，**故障发生时自动修复**：
+不想每次手动点？`StoreAppGuard.exe` 常驻后台，**故障发生时自动修复**，并配有**主窗口界面**：
 
+- **主窗口**：顶部状态灯（绿=监控中/橙=修复中）+「立即检查修复」「开机自启」；中部**应用状态表格**（状态/修复级别/上次修复/是否运行中）；下部**实时日志**（彩色高亮自动跟随）；底部状态栏统计
+- **关窗不退出**：点窗口 X = 最小化到托盘继续守护（气泡提示一次）；双击托盘图标或运行 `StoreAppGuard.exe --show` 唤起主窗口；托盘右键「退出」才真正退出
 - **实时监听** `AppModel-Runtime` 208/216 与 `TWinUI` 5973 激活失败事件；另每 5 分钟周期巡检兜底
 - **自动修复阶梯**（同一应用复发时自动升级手段）：
   1. 重注册 → 2. 重建数据目录+重注册 → 3. 重置应用
@@ -66,7 +68,8 @@
 ```bat
 StoreAppGuard.exe              # 常驻托盘模式
 StoreAppGuard.exe --once --days 3   # 扫描最近3天并修复一轮后退出 (可用于计划任务)
-StoreAppGuard.exe --logviewer        # 只打开内置日志查看器
+StoreAppGuard.exe --logviewer        # 只打开独立日志查看器
+StoreAppGuard.exe --show             # 唤起已运行实例的主窗口
 ```
 
 日志：`logs\guard-YYYYMMDD.log`；升级状态：`guard-state.txt`。

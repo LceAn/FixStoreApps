@@ -49,7 +49,7 @@ function Show-Menu {
     Write-Host "   [2] " -ForegroundColor Cyan -NoNewline; Write-Host "全量重置  " -NoNewline; Write-Host "重注册全部商店应用, 即经典的索引重置命令 (3-8 分钟)" -ForegroundColor Gray
     Write-Host "   [3] " -ForegroundColor Cyan -NoNewline; Write-Host "只看状态  " -NoNewline; Write-Host "扫描最近 72 小时故障记录, 不做任何修改" -ForegroundColor Gray
     Write-Host "   [4] " -ForegroundColor Cyan -NoNewline; Write-Host "打开日志  " -NoNewline; Write-Host "查看历史修复记录 (logs 目录)" -ForegroundColor Gray
-    Write-Host "   [5] " -ForegroundColor Cyan -NoNewline; Write-Host "后台守护  " -NoNewline; Write-Host "启动 StoreAppGuard 常驻进程, 故障自动修复" -ForegroundColor Gray
+    Write-Host "   [5] " -ForegroundColor Cyan -NoNewline; Write-Host "后台守护  " -NoNewline; Write-Host "启动/显示 StoreAppGuard 主窗口, 故障自动修复" -ForegroundColor Gray
     Write-Host "   [0] " -ForegroundColor Cyan -NoNewline; Write-Host "退出" -ForegroundColor Gray
     Write-Host ""
 }
@@ -86,10 +86,11 @@ while ($true) {
             if (-not (Test-Path $exe)) {
                 Write-Host "  [x] 没找到 StoreAppGuard.exe, 请先编译或从仓库下载" -ForegroundColor Red
             } elseif (Get-Process -Name StoreAppGuard -ErrorAction SilentlyContinue) {
-                Write-Host "  [ok] 守护进程已在后台运行 (托盘图标可操作)" -ForegroundColor Green
+                Start-Process $exe -ArgumentList '--show'
+                Write-Host "  [ok] 守护进程已在运行, 已唤起主窗口" -ForegroundColor Green
             } else {
                 Start-Process $exe
-                Write-Host "  [ok] 守护进程已启动 (托盘图标 + 后台自动修复)" -ForegroundColor Green
+                Write-Host "  [ok] 守护进程已启动 (主窗口 + 托盘 + 后台自动修复)" -ForegroundColor Green
             }
         }
         '0' { exit }
