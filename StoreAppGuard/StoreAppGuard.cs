@@ -170,10 +170,11 @@ namespace StoreAppGuard
             menu.Items.Add(miAutoStart);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("关于 StoreAppGuard", null, delegate {
-                MessageBox.Show("商店应用守护进程 StoreAppGuard v1.2\r\n\r\n"
+                MessageBox.Show("商店应用守护进程 StoreAppGuard v1.3\r\n\r\n"
                     + "实时监听商店应用激活失败事件, 自动执行修复阶梯:\r\n"
                     + "  1. 重注册  2. 重建数据目录+重注册  3. 重置应用\r\n"
                     + "三级无效时通知人工重装 (24 小时内不再自动尝试)。\r\n\r\n"
+                    + "巡检间隔可在主窗口顶栏调节 (1-60 分钟, 立即生效)。\r\n"
                     + "关闭窗口 = 最小化到托盘继续守护; 右键托盘图标可退出。\r\n\r\n"
                     + "源码: https://github.com/LceAn/FixStoreApps",
                     "关于", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -318,7 +319,8 @@ namespace StoreAppGuard
         private readonly GuardContext owner;
         private readonly Icon icoGreen, icoOrange;
 
-        private Label lblDot, lblTitle, lblSub;
+        private Label lblDot, lblTitle, lblSub, lblPoll;
+        private NumericUpDown numPoll;
         private DataGridView grid;
         private RichTextBox rtb;
         private CheckBox chkAuto;
@@ -431,15 +433,38 @@ namespace StoreAppGuard
             chkAuto.Height = 30;
             chkAuto.Top = 18;
 
+            // 巡检间隔调节 (1-60 分钟, 修改立即生效并持久化)
+            lblPoll = new Label();
+            lblPoll.Text = "巡检间隔";
+            lblPoll.AutoSize = true;
+            lblPoll.Top = 22;
+            lblPoll.ForeColor = Color.DimGray;
+
+            numPoll = new NumericUpDown();
+            numPoll.Minimum = 1;
+            numPoll.Maximum = 60;
+            numPoll.Width = 52;
+            numPoll.Top = 17;
+            numPoll.Value = engine.PollMinutes;   // 先赋值再挂事件, 避免启动时误写设置
+            numPoll.ValueChanged += delegate
+            {
+                engine.SetPollMinutes((int)numPoll.Value);
+                SyncStrip();
+            };
+
             top.Controls.Add(lblDot);
             top.Controls.Add(lblTitle);
             top.Controls.Add(lblSub);
             top.Controls.Add(btnSweep);
             top.Controls.Add(chkAuto);
+            top.Controls.Add(lblPoll);
+            top.Controls.Add(numPoll);
             top.Resize += delegate
             {
                 chkAuto.Left = top.Width - chkAuto.Width - 16;
                 btnSweep.Left = chkAuto.Left - btnSweep.Width - 10;
+                numPoll.Left = btnSweep.Left - numPoll.Width - 14;
+                lblPoll.Left = numPoll.Left - lblPoll.Width - 4;
             };
 
             btnSweep.Click += delegate
@@ -902,8 +927,8 @@ namespace StoreAppGuard
 
         private void SyncStrip()
         {
-            stripLbl.Text = string.Format("今日修复 {0} 次 · 监控 {1} 个应用 · 事件监听 + 每 5 分钟巡检 · v1.2",
-                curTodayFix, curWatched);
+            stripLbl.Text = string.Format("今日修复 {0} 次 · 监控 {1} 个应用 · 事件监听 + 每 {2} 分钟巡检 · v1.3",
+                curTodayFix, curWatched, engine.PollMinutes);
         }
 
         // 尾随今天日志的最后 400 行
@@ -1144,7 +1169,12 @@ namespace StoreAppGuard
 
         internal string BaseDir { get; private set; }
         internal string LogDir { get; private set; }
+        internal int PollMinutes { get; private set; }   // 巡检间隔 (分钟, 1-60, 可配置持久化)
         private string StatePath { get; set; }
+        private string SettingsPath
+        {
+            get { return Path.Combine(BaseDir, "guard-settings.txt"); }
+        }
         private string LogFile
         {
             get { return Path.Combine(LogDir, "guard-" + DateTime.Now.ToString("yyyyMMdd") + ".log"); }
@@ -1209,6 +1239,7 @@ namespace StoreAppGuard
             BaseDir = AppDomain.CurrentDomain.BaseDirectory;
             LogDir = Path.Combine(BaseDir, "logs");
             StatePath = Path.Combine(BaseDir, "guard-state.txt");
+            LoadSettings(); // 先读设置, UI 构造时才能正确显示
             try { if (!Directory.Exists(LogDir)) Directory.CreateDirectory(LogDir); } catch { }
         }
 
@@ -1220,9 +1251,9 @@ namespace StoreAppGuard
             Subscribe(LogAppModel);
             Subscribe(LogTWinUI);
             debounceTimer = new System.Threading.Timer(delegate { ProcessPending(); }, null, Timeout.Infinite, Timeout.Infinite);
-            // 启动 20 秒后补一次启动期扫描(近1天), 之后每 5 分钟轮询兜底(近6分钟)
+            // 启动 20 秒后补一次启动期扫描(近1天), 之后按配置间隔巡检 (窗口随间隔自适应, 防止调大间隔后漏事件)
             startTimer = new System.Threading.Timer(delegate { RunSweepMinutes(60 * 24); startTimer.Dispose(); }, null, 20000, Timeout.Infinite);
-            pollTimer = new System.Threading.Timer(delegate { RunSweepMinutes(6); }, null, 90000, 300000);
+            pollTimer = new System.Threading.Timer(delegate { RunSweepMinutes(Math.Max(6, PollMinutes + 2)); }, null, 90000, PollMinutes * 60000);
             // 3 秒后异步补全在册应用的 安装位置/包全名 (UI 图标/友好名依赖)
             System.Threading.Timer hyd = null;
             hyd = new System.Threading.Timer(delegate
@@ -1230,7 +1261,59 @@ namespace StoreAppGuard
                 hyd.Dispose();
                 try { HydrateLocations(); } catch { }
             }, null, 3000, Timeout.Infinite);
-            WriteLog("[ok] 守护启动, 事件监听 + 周期巡检已就绪");
+            CleanupOldLogs(); // 顺手清理 30 天前的旧日志
+            WriteLog("[ok] 守护启动, 事件监听 + 每 " + PollMinutes + " 分钟巡检已就绪");
+        }
+
+        // 设置巡检间隔 (UI 调用), 立即生效并持久化
+        internal void SetPollMinutes(int minutes)
+        {
+            if (minutes < 1) minutes = 1;
+            if (minutes > 60) minutes = 60;
+            lock (gate) { PollMinutes = minutes; }
+            SaveSettings();
+            if (pollTimer != null) pollTimer.Change(15000, minutes * 60000); // 15 秒后按新间隔巡检
+            WriteLog("巡检间隔已改为 " + minutes + " 分钟");
+        }
+
+        // ---------------- 设置与日志维护 ----------------
+
+        private void LoadSettings()
+        {
+            try
+            {
+                if (!File.Exists(SettingsPath)) { PollMinutes = 5; return; }
+                foreach (string line in File.ReadAllLines(SettingsPath))
+                {
+                    string l = line.Trim();
+                    if (l.StartsWith("pollMinutes="))
+                    {
+                        int v;
+                        if (int.TryParse(l.Substring(12), out v)) PollMinutes = Math.Max(1, Math.Min(60, v));
+                    }
+                }
+            }
+            catch { PollMinutes = 5; }
+        }
+
+        private void SaveSettings()
+        {
+            try { File.WriteAllText(SettingsPath, "pollMinutes=" + PollMinutes + Environment.NewLine, Utf8NoBom); }
+            catch { }
+        }
+
+        // 清理 30 天前的旧守护日志
+        private void CleanupOldLogs()
+        {
+            try
+            {
+                DateTime cutoff = DateTime.Now.AddDays(-30);
+                foreach (string f in Directory.GetFiles(LogDir, "guard-*.log"))
+                {
+                    if (File.GetLastWriteTime(f) < cutoff) File.Delete(f);
+                }
+            }
+            catch { }
         }
 
         // 一次性查询全部在册应用的位置/全名补进状态库 (UI 图标/名称依赖)
