@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
@@ -82,6 +82,29 @@ namespace StoreAppGuard
             }
 
             // ---- 常驻模式: 单实例 + 托盘 ----
+            // 全局异常保护: UI 线程/后台线程异常写 crash 日志, 不让进程崩掉 (守护要活得久)
+            string logDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+            try { if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir); } catch { }
+            Action<string, object> logCrash = delegate(string tag, object ex)
+            {
+                try
+                {
+                    File.AppendAllText(Path.Combine(logDir, "crash-" + DateTime.Now.ToString("yyyyMMdd") + ".log"),
+                        "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + tag + ": " + ex + Environment.NewLine,
+                        new UTF8Encoding(true));
+                }
+                catch { }
+            };
+            Application.ThreadException += delegate(object s, System.Threading.ThreadExceptionEventArgs e)
+            {
+                logCrash("UI线程异常", e.Exception);
+            };
+            AppDomain.CurrentDomain.UnhandledException += delegate(object s, UnhandledExceptionEventArgs e)
+            {
+                logCrash("后台异常", e.ExceptionObject);
+            };
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+
             bool createdNew;
             Mutex mtx = new Mutex(true, "StoreAppGuard_SingleInstance", out createdNew);
             if (!createdNew) return; // 已在运行
@@ -170,7 +193,7 @@ namespace StoreAppGuard
             menu.Items.Add(miAutoStart);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("关于 StoreAppGuard", null, delegate {
-                MessageBox.Show("商店应用守护进程 StoreAppGuard v1.3\r\n\r\n"
+                MessageBox.Show("商店应用守护进程 StoreAppGuard v1.4\r\n\r\n"
                     + "实时监听商店应用激活失败事件, 自动执行修复阶梯:\r\n"
                     + "  1. 重注册  2. 重建数据目录+重注册  3. 重置应用\r\n"
                     + "三级无效时通知人工重装 (24 小时内不再自动尝试)。\r\n\r\n"
@@ -327,9 +350,22 @@ namespace StoreAppGuard
         private Button btnSweep, btnViewer, btnExit;
         private ToolStripStatusLabel stripLbl;
         private System.Windows.Forms.Timer uiTimer;
-        private DateTime logStamp = DateTime.MinValue;
         private int gridTick;
         internal bool RealClose; // true = 真退出, 否则关窗=隐藏到托盘
+
+        // ---- 防卡死改造 ----
+        // 进程探测移到后台线程 (Process.MainModule 慢且会抛异常, 在 UI 线程跑会造成周期性冻结)
+        private readonly object runGate = new object();
+        private HashSet<string> runningNow = new HashSet<string>();
+        private System.Threading.Timer probeTimer;
+        // 刷新合并: 无论多少个事件请求刷新, UI 一次只排一个 (防 BeginInvoke 积压)
+        private int refreshQueued;
+        // 增量日志尾随 (原实现每 2 秒全量重建 400 行彩色 RichTextBox)
+        private long tailOffset = -1;
+        private string tailPath;
+        private readonly System.Text.StringBuilder tailPending = new System.Text.StringBuilder();
+        // 网格内容签名 (数据没变就不重建行, 省掉无谓的 Clear+Add 抖动)
+        private string gridSig = "";
 
         internal MainForm(Engine eng, GuardContext own)
         {
@@ -350,15 +386,12 @@ namespace StoreAppGuard
             BuildStrip();
             BuildBottomBar();
 
-            // 引擎事件 -> UI 线程刷新
+            // 引擎事件 -> UI 线程刷新 (经合并, 防积压)
             engine.BusyChanged += delegate(bool busy)
             {
                 SafeInvoke(delegate { ApplyBusy(busy); });
             };
-            engine.StateChanged += delegate
-            {
-                SafeInvoke(delegate { RefreshGrid(); });
-            };
+            engine.StateChanged += delegate { RefreshCoalesced(); };
 
             uiTimer = new System.Windows.Forms.Timer();
             uiTimer.Interval = 2000;
@@ -366,16 +399,69 @@ namespace StoreAppGuard
             {
                 LoadTail();
                 gridTick++;
-                if (gridTick >= 5) { gridTick = 0; RefreshGrid(); } // 每 10 秒刷一次应用状态
+                if (gridTick >= 5) { gridTick = 0; RefreshGrid(); } // 每 10 秒刷一次应用状态 (现在很便宜)
                 SyncStrip();
             };
             uiTimer.Start();
+            // 进程探测纯后台: 每 8 秒刷新"运行中"标记
+            probeTimer = new System.Threading.Timer(delegate { ProbeRunning(); }, null, 4000, 8000);
 
             Load += delegate { RefreshGrid(); LoadTail(); SyncStrip(); };
+            FormClosed += delegate
+            {
+                uiTimer.Stop();
+                if (probeTimer != null) probeTimer.Dispose();
+            };
             FormClosing += delegate(object s, FormClosingEventArgs e)
             {
                 if (!RealClose) { e.Cancel = true; owner.HideToTray(); }
             };
+        }
+
+        // 合并刷新请求: 同时来 N 个也只跑一遍 RefreshGrid (防消息队列积压导致"卡死")
+        private void RefreshCoalesced()
+        {
+            if (System.Threading.Interlocked.CompareExchange(ref refreshQueued, 1, 0) != 0) return;
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    refreshQueued = 0;
+                    if (!IsDisposed) RefreshGrid();
+                });
+            }
+            catch { refreshQueued = 0; }
+        }
+
+        // 后台探测各应用是否有进程在跑 (MainModule 访问慢且对系统进程会抛异常, 绝不能放 UI 线程)
+        private void ProbeRunning()
+        {
+            try
+            {
+                List<Engine.PkgView> snap = engine.GetStateSnapshot();
+                HashSet<string> set = new HashSet<string>();
+                if (snap.Count > 0)
+                {
+                    Process[] ps = Process.GetProcesses();
+                    foreach (Engine.PkgView v in snap)
+                    {
+                        if (v.InstallLocation == null) continue;
+                        foreach (Process p in ps)
+                        {
+                            bool hit = false;
+                            try
+                            {
+                                if (p.MainModule != null && p.MainModule.FileName != null
+                                    && p.MainModule.FileName.StartsWith(v.InstallLocation, StringComparison.OrdinalIgnoreCase)) hit = true;
+                            }
+                            catch { } // 系统/提权进程读不到 MainModule
+                            if (hit) { set.Add(v.Family); break; }
+                        }
+                    }
+                }
+                lock (runGate) { runningNow = set; }
+            }
+            catch { }
         }
 
         private void SafeInvoke(MethodInvoker a)
@@ -523,6 +609,10 @@ namespace StoreAppGuard
             grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
             grid.ColumnHeadersHeight = 30;
             grid.RowTemplate.Height = 40;
+            // 双缓冲: 消除带图标行重绘时的闪烁/撕裂 (属性是 protected, 反射打开)
+            typeof(DataGridView).GetProperty("DoubleBuffered",
+                System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)
+                .SetValue(grid, true, null);
             grid.Columns.Add("app", "应用");
             grid.Columns["app"].FillWeight = 26;
             grid.Columns.Add("state", "状态");
@@ -758,7 +848,7 @@ namespace StoreAppGuard
                     if (ico != null) iconCache[fam] = ico;
                     if (name != null) nameCache[fam] = name;
                 }
-                SafeInvoke(RefreshGrid);
+                RefreshCoalesced();
             });
         }
 
@@ -867,36 +957,40 @@ namespace StoreAppGuard
             try
             {
                 List<Engine.PkgView> snap = engine.GetStateSnapshot();
-                Process[] procs = Process.GetProcesses();
                 DateTime now = DateTime.Now;
-                grid.Rows.Clear();
                 int todayFix = 0;
                 foreach (Engine.PkgView v in snap)
                 {
                     if (v.LastRepair.Date == now.Date) todayFix++;
+                }
+                curTodayFix = todayFix;
+                curWatched = snap.Count;
 
+                // "运行中"读后台探测缓存 (UI 线程不再碰 Process API)
+                HashSet<string> runSet;
+                lock (runGate) { runSet = new HashSet<string>(runningNow); }
+
+                // 数据没变就不重建 (原实现 Clear+Add 全量重建, 与积压刷新叠加造成卡顿)
+                StringBuilder sig = new StringBuilder();
+                foreach (Engine.PkgView v in snap)
+                {
+                    sig.Append(v.Family).Append('|').Append(v.Rung).Append('|').Append(v.LastRepair.Ticks)
+                       .Append('|').Append(v.ManualUntil.Ticks).Append('|')
+                       .Append(runSet.Contains(v.Family) ? '1' : '0').Append(';');
+                }
+                string s = sig.ToString();
+                if (s == gridSig) return;
+                gridSig = s;
+
+                grid.Rows.Clear();
+                foreach (Engine.PkgView v in snap)
+                {
                     string status; Color c;
                     if (v.ManualUntil == DateTime.MaxValue) { status = "已忽略(残留记录)"; c = Color.Gray; }
                     else if (v.ManualUntil > now) { status = "待人工处理 至 " + v.ManualUntil.ToString("MM-dd HH:mm"); c = Color.Firebrick; }
                     else if (v.LastRepair != DateTime.MinValue && now - v.LastRepair < TimeSpan.FromMinutes(15)) { status = "修复冷却中"; c = Color.DarkOrange; }
                     else if (v.Rung > 0) { status = "监控中·已修" + v.Rung + "级"; c = Color.Green; }
                     else { status = "监控中"; c = Color.Green; }
-
-                    string run = "-";
-                    if (v.InstallLocation != null)
-                    {
-                        foreach (Process p in procs)
-                        {
-                            bool hit = false;
-                            try
-                            {
-                                if (p.MainModule != null && p.MainModule.FileName != null
-                                    && p.MainModule.FileName.StartsWith(v.InstallLocation, StringComparison.OrdinalIgnoreCase)) hit = true;
-                            }
-                            catch { } // 系统/提权进程读不到 MainModule, 忽略
-                            if (hit) { run = "●"; break; }
-                        }
-                    }
 
                     Image ico = null; string name;
                     lock (metaGate)
@@ -906,6 +1000,7 @@ namespace StoreAppGuard
                     }
                     QueueMeta(v); // 没有图标时后台补
 
+                    string run = runSet.Contains(v.Family) ? "●" : "-";
                     string lastfix = v.LastRepair == DateTime.MinValue ? "-" : v.LastRepair.ToString("MM-dd HH:mm");
                     int i = grid.Rows.Add(ico, name, status, v.Rung == 0 ? "-" : "第" + v.Rung + "级", lastfix, run);
                     grid.Rows[i].Tag = v.Family;                       // 右键菜单据此定位
@@ -917,8 +1012,6 @@ namespace StoreAppGuard
                     if (v.ManualUntil == DateTime.MaxValue) grid.Rows[i].DefaultCellStyle.ForeColor = Color.Gray;
                 }
                 grid.ClearSelection();
-                curTodayFix = todayFix;
-                curWatched = snap.Count;
             }
             catch { }
         }
@@ -927,43 +1020,67 @@ namespace StoreAppGuard
 
         private void SyncStrip()
         {
-            stripLbl.Text = string.Format("今日修复 {0} 次 · 监控 {1} 个应用 · 事件监听 + 每 {2} 分钟巡检 · v1.3",
+            stripLbl.Text = string.Format("今日修复 {0} 次 · 监控 {1} 个应用 · 事件监听 + 每 {2} 分钟巡检 · v1.4",
                 curTodayFix, curWatched, engine.PollMinutes);
         }
 
-        // 尾随今天日志的最后 400 行
+        // 增量尾随日志: 只读新增字节追加渲染 (原实现文件一变就整块清空重绘 400 行, 是 UI 卡顿源头之一)
         private void LoadTail()
         {
             try
             {
                 string path = Path.Combine(engine.LogDir, "guard-" + DateTime.Now.ToString("yyyyMMdd") + ".log");
                 if (!File.Exists(path)) return;
-                DateTime stamp = File.GetLastWriteTimeUtc(path);
-                if (stamp == logStamp) return;
-                logStamp = stamp;
+                long len;
+                using (FileStream fs0 = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)) { len = fs0.Length; }
+                if (path != tailPath) { tailPath = path; tailOffset = 0; tailPending.Length = 0; rtb.Clear(); }
+                if (len == tailOffset) return;
+                if (len < tailOffset) { tailOffset = 0; tailPending.Length = 0; rtb.Clear(); } // 日志轮转/截断
 
-                rtb.Text = "";
-                string[] lines = File.ReadAllLines(path, Encoding.UTF8);
-                int start = Math.Max(0, lines.Length - 400);
-                for (int i = start; i < lines.Length; i++)
+                string chunk;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                 {
-                    string l = lines[i];
-                    if (l.Length == 0) continue;
-                    Color c = Color.Black;
-                    if (l.IndexOf("[ok]") >= 0) c = Color.FromArgb(0, 128, 0);
-                    else if (l.IndexOf("[x]") >= 0) c = Color.FromArgb(200, 30, 30);
-                    else if (l.IndexOf("[!]") >= 0 || l.IndexOf("人工") >= 0) c = Color.FromArgb(190, 110, 0);
-                    else if (l.IndexOf("修复") >= 0 || l.IndexOf("事件:") >= 0 || l.IndexOf("巡检") >= 0) c = Color.FromArgb(0, 90, 160);
-                    rtb.SelectionStart = rtb.TextLength;
-                    rtb.SelectionLength = 0;
-                    rtb.SelectionColor = c;
-                    rtb.AppendText(l + "\n");
+                    fs.Seek(tailOffset, SeekOrigin.Begin);
+                    using (StreamReader sr = new StreamReader(fs, Encoding.UTF8))
+                    {
+                        chunk = sr.ReadToEnd();
+                        tailOffset = fs.Position;
+                    }
                 }
-                rtb.SelectionColor = Color.Black;
+                tailPending.Append(chunk);
+                string buf = tailPending.ToString();
+                tailPending.Length = 0;
+                int idx = 0, nl;
+                while ((nl = buf.IndexOf('\n', idx)) >= 0)
+                {
+                    string line = buf.Substring(idx, nl - idx).TrimEnd('\r');
+                    idx = nl + 1;
+                    if (line.Length > 0) AppendColored(line);
+                }
+                if (idx < buf.Length) tailPending.Append(buf.Substring(idx)); // 半行留到下次拼接
+                if (rtb.TextLength > 120000) { rtb.Clear(); } // 防无界增长
                 rtb.SelectionStart = rtb.TextLength;
                 rtb.ScrollToCaret();
             }
             catch { }
+        }
+
+        private static Color ColorForLine(string l)
+        {
+            if (l.IndexOf("[ok]") >= 0) return Color.FromArgb(0, 128, 0);
+            if (l.IndexOf("[x]") >= 0) return Color.FromArgb(200, 30, 30);
+            if (l.IndexOf("[!]") >= 0 || l.IndexOf("人工") >= 0) return Color.FromArgb(190, 110, 0);
+            if (l.IndexOf("修复") >= 0 || l.IndexOf("事件:") >= 0 || l.IndexOf("巡检") >= 0 || l.IndexOf("右键") >= 0) return Color.FromArgb(0, 90, 160);
+            return Color.Black;
+        }
+
+        private void AppendColored(string l)
+        {
+            rtb.SelectionStart = rtb.TextLength;
+            rtb.SelectionLength = 0;
+            rtb.SelectionColor = ColorForLine(l);
+            rtb.AppendText(l + "\n");
+            rtb.SelectionColor = Color.Black;
         }
     }
 
@@ -1166,6 +1283,8 @@ namespace StoreAppGuard
         private readonly List<EventLog> evLogs = new List<EventLog>();
         private System.Threading.Timer pollTimer, debounceTimer, startTimer;
         private bool busy;
+        // 修复串行化闸门: 防抖/巡检/手动可能同时命中同一应用, 两个 PowerShell 并发注册会竞态
+        private static readonly System.Threading.SemaphoreSlim repairGate = new System.Threading.SemaphoreSlim(1, 1);
 
         internal string BaseDir { get; private set; }
         internal string LogDir { get; private set; }
@@ -1508,6 +1627,7 @@ namespace StoreAppGuard
 
         private void RepairFamily(string fam)
         {
+            repairGate.Wait(); // 同一时间只跑一个修复 (后台线程专用, 阻塞等待无妨)
             SetBusy(true);
             try
             {
@@ -1592,7 +1712,7 @@ namespace StoreAppGuard
                     WriteLog("[x] " + fam + " 第" + rung + "级返回: " + r);
                 }
             }
-            finally { SetBusy(false); }
+            finally { SetBusy(false); repairGate.Release(); }
         }
 
         private void MarkManualForever(string fam)
